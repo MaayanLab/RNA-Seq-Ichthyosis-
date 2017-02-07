@@ -1,0 +1,250 @@
+# Ichthyosis -  RNA-Seq (STAR + limma)
+This is an analysis of RNA-Seq data of Ichthyosis samples.
+Prior, the data was mapped by using STAR.
+This code includes quantification (by using featureCounts), basic filteration & normaliztion steps, and differntial expression analysis by using limma
+```{r include=FALSE}
+source ("https://bioconductor.org/biocLite.R")
+biocLite()
+require(Rsubread)
+require(limma)
+require(edgeR)
+require(DESeq)
+require(knitr)
+require(gplots)
+```
+
+## Pre-processing of the data
+First, we would like to set the directory and get access to the BAM files which we got after running the STAR mapping
+```{r}
+opts_knit$set(root.dir="/Volumes/ShaiM/Netherton/Shai")
+bam_files <- list.files(path="/Volumes/ShaiM/Netherton/Shai/", pattern = ".bam")
+bam_files
+```
+
+## Quantification by using featureCounts
+
+```{r}
+for (bam_file in bam_files) {
+  bam_counted_features <- Rsubread::featureCounts(files = bam_file, 
+                                                  annot.ext = "/Volumes/ShaiM/Netherton/Shai/Homo_sapiens.GRCh38.87.gtf",
+                                                  isGTFAnnotationFile = T,
+                                                  GTF.featureType = "exon",
+                                                  GTF.attrType = "gene_name")
+  # Extract the counts object from the list
+  extracted_counts <- bam_counted_features$counts
+  extracted_counts_genes <- rownames(bam_counted_features$counts)
+  extracted_counts_numbers <- bam_counted_features$counts
+  dim(bam_counted_features$counts)
+  raw_data <- data.frame(extracted_counts_genes, extracted_counts_numbers)
+  # Extract sample name
+  sample_name <- strsplit(bam_file, '.', fixed=TRUE)[[1]][1]
+  # Add .txt extension
+  sample_name_txt <- paste0(sample_name, 'extractedCounts.txt')
+  # Write the extracted_counts object to the .txt file
+  write.table(raw_data, file=sample_name_txt, sep="\t")
+}
+txt_files <- c(list.files(path="/Volumes/ShaiM/Netherton/Shai", pattern="Counts.txt"))
+txt_files
+```
+
+
+## Ploting PCA
+We will use edgeR & DESeq packages for this purpose
+```{r}
+pca_data <- readDGE(txt_files)
+```
+
+```{r}
+group <- factor(c("Ichthyosis","Ichthyosis","Control","Control","Control","Control","Control",
+                  "Control","Control","Control","Control","Control","Ichthyosis",
+                  "Ichthyosis","Ichthyosis","Ichthyosis","Control","Ichthyosis"))
+```
+
+```{r}
+pca_data$samples$group <- group
+```
+
+```{r}
+cds <- newCountDataSet(pca_data$counts,group )
+```
+
+```{r}
+cds <- estimateSizeFactors(cds)
+```
+
+```{r}
+sizeFactors(cds)
+```
+
+```{r}
+head( counts(cds, normalized=T))
+```
+
+```{r}
+cds <- estimateDispersions(cds)
+```
+
+```{r}
+cdsFull <- newCountDataSet(pca_data$counts, pca_data$samples)
+```
+
+```{r}
+cdsFull <- estimateSizeFactors(cdsFull)
+```
+
+```{r}
+cdsFullBlind <- estimateDispersions(cdsFull, method="blind")
+```
+
+```{r}
+vsdFull <- varianceStabilizingTransformation( cdsFullBlind)
+```
+
+```{r}
+print(plotPCA(vsdFull, intgroup = "group"))
+```
+
+
+## Clustergrammer
+In the next step, we will leave R and move to **Python**
+
+This is the code that we will run in Python:
+  
+  >*import pandas as pd*
+  >*def main():*
+  >*from clustergrammer import Network*
+	>*net = Network()*
+	>*net.load_file('big_matrix.txt')*
+	>*# net.make_clust(dist_type='cos',views=['N_row_sum', 'N_row_var'])*
+
+	>*net.filter_N_top('row',500, rank_type='sum')*
+
+	>*net.normalize(axis='row', norm_type='zscore')*
+	>*net.write_matrix_to_tsv('small_matrix.txt')*
+  >*main()*
+
+The `small_matrix.txt` now needs to be uploaded to the **clustergrammer** to check for any clusters
+```{r}
+count_matrix <- readDGE(txt_files)
+write.table(count_matrix, file='big_matrix.txt', sep="\t", quote = F)
+```
+
+
+
+## Filtration and normalization steps
+We want to prepare the data for the diffrential expression analysis
+```{r}
+count_matrix <- readDGE(txt_files, path="/Volumes/ShaiM/Netherton/Shai")
+```
+
+```{r}
+group <- as.factor(c("Ichtyosis","Ichtyosis","Control","Control","Control","Control",
+                     "Control","Control","Control","Control","Control","Control","Ichtyosis",
+                     "Ichtyosis","Ichtyosis","Ichtyosis","Control","Ichtyosis"))
+count_matrix$samples$group <- group
+colnames(count_matrix) <- gsub('_L001_R1_001extractedCounts','',colnames(count_matrix))
+colnames(count_matrix) <- gsub('_L002_R1_001extractedCounts','',colnames(count_matrix))
+samplenames <- rownames(count_matrix$samples)
+cpm <- cpm(count_matrix)
+lcpm <- cpm(count_matrix, log=T)
+```
+
+```{r}
+# Check how many genes are not expressed throughout all the samples 
+table(rowSums(count_matrix$counts==0)==18)
+```
+
+
+```{r}
+#filter out data
+keep.exprs <- rowSums(cpm>1)>=6
+count_matrix <- count_matrix[keep.exprs, keep.lib.sizes=F]
+dim(count_matrix)
+```
+
+
+
+```{r, warning=FALSE, fig.width=8, fig.height=5, fig.align='left'}
+## clustering samples - MDS plot (multidimentional scaling plot)
+lcpm <- cpm(count_matrix, log=T)
+par(mfrow=c(1,2))
+col.group <- group
+levels(col.group) <- c("red","blue")
+col.group <- as.character(col.group)
+plotMDS(lcpm, levels=group, col=col.group)
+```
+
+
+```{r}
+design <- model.matrix(~0+group)
+colnames(design) <- gsub("group","",colnames(design))
+kable(design)
+```
+
+
+```{r}
+contr.matrix <- makeContrasts(Control_vs_Ichtyosis= Control-Ichtyosis, levels = colnames(design))
+contr.matrix
+```
+
+
+```{r}
+v <- voom(count_matrix, design, plot=T)
+```
+
+```{r}
+v
+```
+
+```{r}
+vfit <- lmFit(v, design)
+vfit <- contrasts.fit(vfit, contrasts = contr.matrix)
+efit <- eBayes(vfit)
+plotSA(efit)
+```
+
+```{r}
+# examinig the number of the DE genes
+summary(decideTests(efit))
+```
+
+
+```{r}
+tfit <- treat(vfit, lfc=1)
+dt <- decideTests(tfit)
+summary(dt)
+```
+
+```{r}
+Control.vs.Ichtyosis <- topTreat(tfit, coef=1, n=Inf)
+kable(head(Control.vs.Ichtyosis))
+write.table(Control.vs.Ichtyosis, file='results.txt', sep="\t", quote = F)
+```
+
+
+```{r}
+plotMD(tfit, column=1, status=dt[,1], main=colnames(tfit)[1], xlim=c(-8, 13))
+```
+
+```{r}
+Control.vs.Ichtyosis.topgenes <- rownames(Control.vs.Ichtyosis)[1:50]
+i <- which(rownames(v$E) %in% Control.vs.Ichtyosis.topgenes)
+mycol <- colorpanel(1000,"blue","white","red")
+par(mar=c(5,4,4,2))
+heatmap.2(v$E[i,],
+          #scale="row",
+          labRow = rownames(v$E)[i],
+          labCol = group,
+          col=mycol, 
+          trace="none",
+          density.info = "none",
+          margin=c(5,8),
+          lhei=c(5,13),
+          dendrogram = "column",
+          key.xlab = 'log-cpm',
+          key.title='',
+          keysize = 1,
+          cexRow = 0.5)
+```
+
+Now, the list of the genes includeing the values can be insterted into **Enrichr** and **L1000CD2**
