@@ -1,0 +1,270 @@
+# Ichthyosis RNA-Seq Analysis (STAR + Charactaristic Direction)
+RNA-Seq analysis of Ichthyosis vs. Control samples.
+
+Prior to the analysis, the data was mapped by using STAR.
+This code includes steps of:
+  * Quantification - by using featureCounts.
+  * Filteration & normaliztion steps.
+  * Differntial Expression Analysis - by using Characteristic Direction.
+
+```{r include=FALSE}
+source ("https://bioconductor.org/biocLite.R")
+biocLite()
+require(Rsubread)
+require(knitr)
+require(DESeq)
+require(edgeR)
+knitr::opts_knit$set(root.dir = '/Volumes/ShaiM/Netherton/Shai')
+```
+
+## Pre-processing of the data
+First, we would like to set the directory and get access to the BAM files which were the output of the mapping step with STAR
+```{r}
+# get all the BAM files
+bam_files <- list.files(path='/Volumes/ShaiM/Netherton/Shai', pattern = ".bam")
+bam_files
+```
+
+## Quantification by using featureCounts
+Now we would like to quantify the data in order to check how many reads are assigned to each gene
+```{r}
+knitr::opts_knit$set(root.dir = '/Volumes/ShaiM/Netherton/Shai')
+
+for (bam_file in bam_files) {
+  bam_counted_features <- Rsubread::featureCounts(files = bam_file, 
+                                                  annot.ext = "/Volumes/ShaiM/Netherton/Shai/Homo_sapiens.GRCh38.87.gtf",
+                                                  isGTFAnnotationFile = T,
+                                                  GTF.featureType = "exon",
+                                                  GTF.attrType = "gene_name")
+  # Extract the counts object from the list
+  extracted_counts <- bam_counted_features$counts
+  extracted_counts_genes <- rownames(bam_counted_features$counts)
+  extracted_counts_numbers <- bam_counted_features$counts
+  dim(bam_counted_features$counts)
+  raw_data <- data.frame(extracted_counts_genes, extracted_counts_numbers)
+  # Extract sample name
+  sample_name <- strsplit(bam_file, '.', fixed=TRUE)[[1]][1]
+  # Add .txt extension
+  sample_name_txt <- paste0(sample_name, 'extractedCounts.txt')
+  # Write the extracted_counts object to the .txt file
+  write.table(raw_data, file=sample_name_txt, sep="\t")
+}
+```
+
+```{r}
+txt_files <- c(list.files(path="/Volumes/ShaiM/Netherton/Shai", pattern="Counts.txt"))
+txt_files
+```
+
+## Ploting PCA
+We will use edgeR & DESeq packages for this purpose
+```{r}
+pca_data <- readDGE(txt_files)
+```
+
+```{r}
+group <- factor(c("Ichthyosis","Ichthyosis","Control","Control","Control","Control","Control",
+                  "Control","Control","Control","Control","Control","Ichthyosis",
+                  "Ichthyosis","Ichthyosis","Ichthyosis","Control","Ichthyosis"))
+```
+
+```{r}
+pca_data$samples$group <- group
+```
+
+```{r}
+cds <- newCountDataSet(pca_data$counts,group )
+```
+
+```{r}
+cds <- estimateSizeFactors(cds)
+```
+
+```{r}
+sizeFactors(cds)
+```
+
+```{r}
+head( counts(cds, normalized=T))
+```
+
+```{r}
+cds <- estimateDispersions(cds)
+```
+
+```{r}
+cdsFull <- newCountDataSet(pca_data$counts, pca_data$samples)
+```
+
+```{r}
+cdsFull <- estimateSizeFactors(cdsFull)
+```
+
+```{r}
+cdsFullBlind <- estimateDispersions(cdsFull, method="blind")
+```
+
+```{r}
+vsdFull <- varianceStabilizingTransformation( cdsFullBlind)
+```
+
+```{r}
+print(plotPCA(vsdFull, intgroup = "group"))
+```
+
+## Filtration steps
+We want to prepare the raw data for the diffrential expression analysis
+```{r}
+count_matrix <- readDGE(txt_files)
+count_matrix <- count_matrix$counts
+head(count_matrix)
+```
+
+```{r}
+# check if there are genes with no expression at all
+table(rowSums(count_matrix==0)==18)
+# looks like around 15% of the genes have no expression at all. we would like to filter them out 
+```
+
+```{r}
+count_matrix <- count_matrix[ rowSums(count_matrix)!=0,]
+dim(count_matrix)
+```
+
+```{r}
+# Now we want that at least 6 samples across the entire experiment will be expressed ni order to continue to 
+# the downstream. 6 was chosen since it is the (n-1) while n is the size of the smallest group
+count_matrix <- count_matrix[apply(count_matrix==0,1,sum)<=6,]
+dim(count_matrix)
+```
+
+
+## Clustergrammer
+```{r}
+write.table(count_matrix, file='big_matrix.txt', sep="\t", quote = F)
+```
+
+In this step, we will leave R and move to **Python**. We will upload the `big_matrix.txt` file and will derive the `small_matrix.txt` file. The `small_matrix.txt` file will be uploaded to the clustergrammer.
+
+This is the code that we will run in Python:
+  
+  `import pandas as pd`
+  `def main():`
+  `from clustergrammer import Network`
+	`net = Network()`
+	`net.load_file('big_matrix.txt')`
+	`# net.make_clust(dist_type='cos',views=['N_row_sum', 'N_row_var'])`
+	`net.filter_N_top('row',500, rank_type='sum')`
+	`net.normalize(axis='row', norm_type='zscore')`
+	`net.write_matrix_to_tsv('small_matrix.txt')`
+  `main()`
+
+
+## Differential Expression Analysis (Characteristic Direction)
+
+```{r}
+"chdirfull" <- function(data,ctrls,expms,npc,r=1)
+{
+  ctrl = data[,ctrls]
+  expm = data[,expms]
+  
+  pp = prcomp(t(data))
+  
+  last = npc
+  
+  V = pp$rotation[,1:last]
+  R = pp$x[1:last,1:last]
+  pcvars = pp$sdev[1:last]
+  
+  meanvec <- rowMeans(expm) - rowMeans(ctrl)
+  
+  Dd <- diag(pcvars)
+  sigma <- mean(diag(Dd))
+  shrunkMats <- r*Dd + sigma*(1-r)*diag(ncol(R))
+  
+  b <- V%*%solve(shrunkMats)%*%t(V)%*%meanvec
+  
+  b <- b*as.vector(sqrt(1/t(b)%*%b))
+  names(b) = rownames(data)
+  
+  b
+}
+```
+
+
+```{r}
+colnames(count_matrix) <- as.list(c("1","1","0","0","0","0","0","0","0","0","0","0","1","1","1","1","0","1"))
+header <- colnames(count_matrix)
+genes <- as.vector(rownames(count_matrix))
+mat <- as.matrix(count_matrix[1:dim(count_matrix)[1],1:dim(count_matrix)[2]])
+```
+
+```{r}
+length(header)
+```
+
+```{r}
+length(genes)
+```
+
+```{r}
+dim(mat)
+```
+
+```{r}
+ctrlMat <- mat[,header==0]
+expmMat<- mat[,header==1]
+colnames(ctrlMat) <- as.list(c("0","0","0","0","0","0","0","0","0","0","0"))
+colnames(expmMat) <- as.list(c("1","1","1","1","1","1","1"))
+```
+
+```{r}
+head(ctrlMat)
+```
+
+```{r}
+head(expmMat)
+```
+
+```{r}
+dim(ctrlMat)
+```
+
+```{r}
+dim(expmMat)
+```
+
+```{r}
+count_matrix <- cbind(ctrlMat,expmMat)
+```
+ 
+```{r}
+unitV <- chdirfull(count_matrix,1:11,12:18,18)
+head(unitV)
+```
+
+We got the least of all the DEG's while the sign represents the direction (up or down) and the value represents the magnitued
+
+Now, we want the top 150 upregulated DEG's
+```{r}
+top_up <- head(unitV[order(unitV[,1], decreasing = T),], n=150)
+top_up <- data.frame(top_up)
+top_up[,2] <- top_up[,1]
+top_up[,1] <- rownames(top_up)
+rownames(top_up) <- NULL
+write.table(top_up, file="top_up150_STAR_CD.txt", col.names=F, quote=F, row.names=T, sep=", ")
+head(top_up)
+```
+
+And the top 150 downregulated DEG's
+```{r}
+top_down <- tail(unitV[order(unitV[,1], decreasing = T),], n=150)
+top_down <- data.frame(top_down)
+top_down[,2] <- top_down[,1]
+top_down[,1] <- rownames(top_down)
+rownames(top_down) <- NULL
+write.table(top_down, file="top_down150_STAR_CD.txt", col.names=F, quote=F, row.names=T, sep=", ")
+tail(top_down)
+```
+
+Now, the list of the genes includeing the values which can be found in `top_up150_STAR_CD.txt` and `top_down150_STAR_CD.txt` can be insterted into **Enricher** and **L1000CD2**
